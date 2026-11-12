@@ -346,7 +346,6 @@ pipeline {
                         LOW: 0
                     ]
 
-                    def parser = new groovy.json.JsonSlurperClassic()
 
                     // Read JSON reports
                     jsonReports.each { report ->
@@ -355,9 +354,7 @@ pipeline {
 
                             try {
 
-                                def data = parser.parseText(
-                                    readFile(report)
-                                )
+                                def data = readJSON(file: report)
 
                                 def counts = [
                                     CRITICAL: 0,
