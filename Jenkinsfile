@@ -3,26 +3,18 @@ pipeline {
 
     options {
         skipDefaultCheckout(true)
-        disableConcurrentBuilds()
         timestamps()
-    }
-
-    parameters {
-        string(
-            name: 'DOCKERFILE_PATH',
-            defaultValue: 'Dockerfile',
-            description: 'Path Dockerfile relatif terhadap root repository'
-        )
-
-        string(
-            name: 'IMAGE_NAME',
-            defaultValue: 'my-app',
-            description: 'Nama Docker image'
-        )
+        disableConcurrentBuilds()
     }
 
     environment {
-        TRIVY_IMAGE = 'aquasec/trivy:latest'
+        TRIVY_IMAGE = 'aquasec/trivy:0.76.1'
+        TRIVY_CACHE = 'trivy-cache'
+        DOCKER_VOLUME = 'jenkins_home'
+
+        MICROSERVICE_IMAGE = 'us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/currencyservice:v0.10.7'
+
+        SCAN_ERRORS = '0'
     }
 
     stages {
@@ -32,182 +24,443 @@ pipeline {
         // ==========================================
         stage('Clean Workspace') {
             steps {
-                cleanWs()
+                deleteDir()
+                echo 'Workspace cleaned successfully.'
             }
         }
 
         // ==========================================
-        // 2. CHECKOUT SOURCE CODE
+        // 2. CHECKOUT SCM
         // ==========================================
         stage('Checkout SCM') {
             steps {
                 checkout scm
-
-                echo 'Source code checkout completed.'
+                echo 'Repository checkout completed.'
             }
         }
 
         // ==========================================
-        // 3. TRIVY FILESYSTEM SCAN
+        // 3. SCA SCAN
         // ==========================================
-        stage('Trivy Filesystem Scan') {
+        stage('SCA Scan') {
             steps {
-                sh '''
-                    set -eu
+                sh 'mkdir -p reports'
 
-                    TRIVY_PATH="/var/jenkins_home/trivy-workspace/${BUILD_NUMBER}"
-                    TRIVY_CACHE="/var/jenkins_home/trivy-cache"
-                    SCAN_TARGET="$TRIVY_PATH/target"
+                script {
 
-                    echo "===== PREPARING FILESYSTEM SCAN ====="
+                    // ----------------------------------
+                    // SCA - SECURE
+                    // ----------------------------------
+                    echo 'Scanning secure dependencies...'
 
-                    mkdir -p "$SCAN_TARGET"
-                    mkdir -p "$TRIVY_CACHE"
+                    def secureStatus = sh(
+                        returnStatus: true,
+                        script: """
+                            docker run --rm \
+                              -v ${DOCKER_VOLUME}:/var/jenkins_home \
+                              -v ${TRIVY_CACHE}:/root/.cache/ \
+                              -w "${env.WORKSPACE}" \
+                              ${TRIVY_IMAGE} fs \
+                              --scanners vuln \
+                              --skip-version-check \
+                              --format json \
+                              --output reports/sca-secure.json \
+                              secure/
+                        """
+                    )
 
-                    # Salin seluruh isi repository ke named volume
-                    cp -a "$WORKSPACE/." "$SCAN_TARGET/"
+                    if (secureStatus != 0) {
+                        env.SCAN_ERRORS = '1'
+                        echo 'ERROR: Secure SCA scan failed.'
+                    } else {
 
-                    echo "===== RUNNING TRIVY FILESYSTEM SCAN ====="
+                        def secureSarifStatus = sh(
+                            returnStatus: true,
+                            script: """
+                                docker run --rm \
+                                  -v ${DOCKER_VOLUME}:/var/jenkins_home \
+                                  -w "${env.WORKSPACE}" \
+                                  ${TRIVY_IMAGE} convert \
+                                  --format sarif \
+                                  --output reports/sca-secure.sarif \
+                                  reports/sca-secure.json
+                            """
+                        )
 
-                    docker run --rm \
-                        -v jenkins_home:/jenkins_home \
-                        "$TRIVY_IMAGE" \
-                        fs "/jenkins_home/trivy-workspace/${BUILD_NUMBER}/target" \
-                        --cache-dir /jenkins_home/trivy-cache \
-                        --scanners vuln,misconfig,secret \
-                        --severity HIGH,CRITICAL \
-                        --format json \
-                        --output "/jenkins_home/trivy-workspace/${BUILD_NUMBER}/trivy-fs-report.json" \
-                        --exit-code 0
+                        if (secureSarifStatus != 0) {
+                            env.SCAN_ERRORS = '1'
+                            echo 'ERROR: Secure SARIF conversion failed.'
+                        }
+                    }
 
-                    # Salin laporan ke Jenkins workspace
-                    cp "$TRIVY_PATH/trivy-fs-report.json" \
-                       "$WORKSPACE/trivy-fs-report.json"
+                    // ----------------------------------
+                    // SCA - UNSECURE
+                    // ----------------------------------
+                    echo 'Scanning unsecure dependencies...'
 
-                    echo "===== FILESYSTEM SCAN COMPLETED ====="
-                '''
+                    def unsecureStatus = sh(
+                        returnStatus: true,
+                        script: """
+                            docker run --rm \
+                              -v ${DOCKER_VOLUME}:/var/jenkins_home \
+                              -v ${TRIVY_CACHE}:/root/.cache/ \
+                              -w "${env.WORKSPACE}" \
+                              ${TRIVY_IMAGE} fs \
+                              --scanners vuln \
+                              --skip-version-check \
+                              --format json \
+                              --output reports/sca-unsecure.json \
+                              unsecure/
+                        """
+                    )
+
+                    if (unsecureStatus != 0) {
+                        env.SCAN_ERRORS = '1'
+                        echo 'ERROR: Unsecure SCA scan failed.'
+                    } else {
+
+                        def unsecureSarifStatus = sh(
+                            returnStatus: true,
+                            script: """
+                                docker run --rm \
+                                  -v ${DOCKER_VOLUME}:/var/jenkins_home \
+                                  -w "${env.WORKSPACE}" \
+                                  ${TRIVY_IMAGE} convert \
+                                  --format sarif \
+                                  --output reports/sca-unsecure.sarif \
+                                  reports/sca-unsecure.json
+                            """
+                        )
+
+                        if (unsecureSarifStatus != 0) {
+                            env.SCAN_ERRORS = '1'
+                            echo 'ERROR: Unsecure SARIF conversion failed.'
+                        }
+                    }
+                }
             }
         }
 
         // ==========================================
-        // 4. BUILD DOCKER IMAGE
+        // 4. IMAGE SCAN - UNSECURE
         // ==========================================
-        stage('Build Docker Image') {
+        stage('Image Scan - Unsecure') {
             steps {
-                sh '''
-                    set -eu
+                script {
 
-                    DOCKERFILE_PATH="${DOCKERFILE_PATH}"
-                    IMAGE_TAG="${BUILD_NUMBER}"
+                    echo 'Scanning app-unsecure:v1...'
 
-                    echo "===== VALIDATING DOCKERFILE ====="
+                    def scanStatus = sh(
+                        returnStatus: true,
+                        script: """
+                            docker run --rm \
+                              -v /var/run/docker.sock:/var/run/docker.sock \
+                              -v ${DOCKER_VOLUME}:/var/jenkins_home \
+                              -v ${TRIVY_CACHE}:/root/.cache/ \
+                              -w "${env.WORKSPACE}" \
+                              ${TRIVY_IMAGE} image \
+                              --scanners vuln \
+                              --skip-version-check \
+                              --format json \
+                              --output reports/unsecure.json \
+                              app-unsecure:v1
+                        """
+                    )
 
-                    if [ ! -f "$WORKSPACE/$DOCKERFILE_PATH" ]; then
-                        echo "ERROR: Dockerfile tidak ditemukan: $DOCKERFILE_PATH"
-                        exit 1
-                    fi
+                    if (scanStatus != 0) {
+                        env.SCAN_ERRORS = '1'
+                        echo 'ERROR: Unsecure image scan failed.'
+                    } else {
 
-                    echo "Dockerfile: $DOCKERFILE_PATH"
-                    echo "Image: ${IMAGE_NAME}:${IMAGE_TAG}"
+                        def sarifStatus = sh(
+                            returnStatus: true,
+                            script: """
+                                docker run --rm \
+                                  -v ${DOCKER_VOLUME}:/var/jenkins_home \
+                                  -w "${env.WORKSPACE}" \
+                                  ${TRIVY_IMAGE} convert \
+                                  --format sarif \
+                                  --output reports/unsecure.sarif \
+                                  reports/unsecure.json
+                            """
+                        )
 
-                    echo "===== BUILDING DOCKER IMAGE ====="
-
-                    docker build \
-                        --pull \
-                        -f "$DOCKERFILE_PATH" \
-                        -t "${IMAGE_NAME}:${IMAGE_TAG}" \
-                        "$WORKSPACE"
-
-                    echo "===== DOCKER IMAGE BUILT ====="
-
-                    docker images "${IMAGE_NAME}:${IMAGE_TAG}"
-                '''
+                        if (sarifStatus != 0) {
+                            env.SCAN_ERRORS = '1'
+                            echo 'ERROR: Unsecure SARIF conversion failed.'
+                        }
+                    }
+                }
             }
         }
 
         // ==========================================
-        // 5. TRIVY IMAGE SCAN
+        // 5. IMAGE SCAN - SECURE
         // ==========================================
-        stage('Trivy Image Scan') {
+        stage('Image Scan - Secure') {
             steps {
-                sh '''
-                    set -eu
+                script {
 
-                    IMAGE_TAG="${BUILD_NUMBER}"
+                    echo 'Scanning app-secure:v1...'
 
-                    TRIVY_PATH="/var/jenkins_home/trivy-workspace/${BUILD_NUMBER}"
-                    TRIVY_REPORT="$TRIVY_PATH/trivy-image-report.json"
+                    def scanStatus = sh(
+                        returnStatus: true,
+                        script: """
+                            docker run --rm \
+                              -v /var/run/docker.sock:/var/run/docker.sock \
+                              -v ${DOCKER_VOLUME}:/var/jenkins_home \
+                              -v ${TRIVY_CACHE}:/root/.cache/ \
+                              -w "${env.WORKSPACE}" \
+                              ${TRIVY_IMAGE} image \
+                              --scanners vuln \
+                              --skip-version-check \
+                              --format json \
+                              --output reports/secure.json \
+                              app-secure:v1
+                        """
+                    )
 
-                    echo "===== RUNNING TRIVY IMAGE SCAN ====="
+                    if (scanStatus != 0) {
+                        env.SCAN_ERRORS = '1'
+                        echo 'ERROR: Secure image scan failed.'
+                    } else {
 
-                    set +e
+                        def sarifStatus = sh(
+                            returnStatus: true,
+                            script: """
+                                docker run --rm \
+                                  -v ${DOCKER_VOLUME}:/var/jenkins_home \
+                                  -w "${env.WORKSPACE}" \
+                                  ${TRIVY_IMAGE} convert \
+                                  --format sarif \
+                                  --output reports/secure.sarif \
+                                  reports/secure.json
+                            """
+                        )
 
-                    docker run --rm \
-                        -v /var/run/docker.sock:/var/run/docker.sock \
-                        -v jenkins_home:/jenkins_home \
-                        "$TRIVY_IMAGE" \
-                        image "${IMAGE_NAME}:${IMAGE_TAG}" \
-                        --cache-dir /jenkins_home/trivy-cache \
-                        --severity HIGH,CRITICAL \
-                        --ignore-unfixed \
-                        --format json \
-                        --output "$TRIVY_REPORT" \
-                        --exit-code 1
+                        if (sarifStatus != 0) {
+                            env.SCAN_ERRORS = '1'
+                            echo 'ERROR: Secure SARIF conversion failed.'
+                        }
+                    }
+                }
+            }
+        }
 
-                    TRIVY_STATUS=$?
+        // ==========================================
+        // 6. IMAGE SCAN - MICROSERVICE
+        // ==========================================
+        stage('Image Scan - Microservice') {
+            steps {
+                script {
 
-                    set -e
+                    echo "Scanning ${MICROSERVICE_IMAGE}..."
 
-                    # Simpan laporan sebelum mengembalikan exit code
-                    if [ -f "$TRIVY_REPORT" ]; then
-                        cp "$TRIVY_REPORT" \
-                           "$WORKSPACE/trivy-image-report.json"
+                    def scanStatus = sh(
+                        returnStatus: true,
+                        script: """
+                            docker run --rm \
+                              -v /var/run/docker.sock:/var/run/docker.sock \
+                              -v ${DOCKER_VOLUME}:/var/jenkins_home \
+                              -v ${TRIVY_CACHE}:/root/.cache/ \
+                              -w "${env.WORKSPACE}" \
+                              ${TRIVY_IMAGE} image \
+                              --scanners vuln \
+                              --skip-version-check \
+                              --format json \
+                              --output reports/microservice.json \
+                              "${MICROSERVICE_IMAGE}"
+                        """
+                    )
 
-                        echo "Image scan report copied successfully."
-                    else
-                        echo "WARNING: Image scan report was not generated."
-                    fi
+                    if (scanStatus != 0) {
+                        env.SCAN_ERRORS = '1'
+                        echo 'ERROR: Microservice image scan failed.'
+                    } else {
 
-                    if [ "$TRIVY_STATUS" -ne 0 ]; then
-                        echo "===== IMAGE SCAN FAILED ====="
-                        echo "Vulnerability ditemukan atau proses scan mengalami error."
-                        exit "$TRIVY_STATUS"
-                    fi
+                        def sarifStatus = sh(
+                            returnStatus: true,
+                            script: """
+                                docker run --rm \
+                                  -v ${DOCKER_VOLUME}:/var/jenkins_home \
+                                  -w "${env.WORKSPACE}" \
+                                  ${TRIVY_IMAGE} convert \
+                                  --format sarif \
+                                  --output reports/microservice.sarif \
+                                  reports/microservice.json
+                            """
+                        )
 
-                    echo "===== IMAGE SCAN COMPLETED ====="
-                '''
+                        if (sarifStatus != 0) {
+                            env.SCAN_ERRORS = '1'
+                            echo 'ERROR: Microservice SARIF conversion failed.'
+                        }
+                    }
+                }
+            }
+        }
+
+        // ==========================================
+        // 7. SECURITY GATE
+        // ==========================================
+        stage('Security Gate') {
+            steps {
+                script {
+
+                    def jsonReports = [
+                        'reports/sca-secure.json',
+                        'reports/sca-unsecure.json',
+                        'reports/unsecure.json',
+                        'reports/secure.json',
+                        'reports/microservice.json'
+                    ]
+
+                    def sarifReports = [
+                        'reports/sca-secure.sarif',
+                        'reports/sca-unsecure.sarif',
+                        'reports/unsecure.sarif',
+                        'reports/secure.sarif',
+                        'reports/microservice.sarif'
+                    ]
+
+                    def allReports = jsonReports + sarifReports
+
+                    // Check report completeness
+                    def missingReports = allReports.findAll {
+                        !fileExists(it)
+                    }
+
+                    if (!missingReports.isEmpty()) {
+                        echo 'Missing reports:'
+
+                        missingReports.each {
+                            echo " - ${it}"
+                        }
+                    }
+
+                    // Initialize severity counters
+                    def totals = [
+                        CRITICAL: 0,
+                        HIGH: 0,
+                        MEDIUM: 0,
+                        LOW: 0
+                    ]
+
+                    def parser = new groovy.json.JsonSlurperClassic()
+
+                    // Read JSON reports
+                    jsonReports.each { report ->
+
+                        if (fileExists(report)) {
+
+                            try {
+
+                                def data = parser.parseText(
+                                    readFile(report)
+                                )
+
+                                def counts = [
+                                    CRITICAL: 0,
+                                    HIGH: 0,
+                                    MEDIUM: 0,
+                                    LOW: 0
+                                ]
+
+                                (data.Results ?: []).each { result ->
+
+                                    (result.Vulnerabilities ?: []).each { vuln ->
+
+                                        def severity = (
+                                            vuln.Severity ?: 'UNKNOWN'
+                                        ).toUpperCase()
+
+                                        if (counts.containsKey(severity)) {
+                                            counts[severity]++
+                                            totals[severity]++
+                                        }
+                                    }
+                                }
+
+                                echo """
+                                ==================================
+                                REPORT: ${report}
+                                ==================================
+                                CRITICAL : ${counts.CRITICAL}
+                                HIGH     : ${counts.HIGH}
+                                MEDIUM   : ${counts.MEDIUM}
+                                LOW      : ${counts.LOW}
+                                """
+
+                            } catch (Exception e) {
+
+                                env.SCAN_ERRORS = '1'
+
+                                echo "ERROR: Unable to parse ${report}"
+                                echo "Reason: ${e.getMessage()}"
+                            }
+                        }
+                    }
+
+                    // Display overall summary
+                    echo """
+                    ==========================================
+                    TOTAL VULNERABILITY FINDINGS
+                    ==========================================
+                    CRITICAL : ${totals.CRITICAL}
+                    HIGH     : ${totals.HIGH}
+                    MEDIUM   : ${totals.MEDIUM}
+                    LOW      : ${totals.LOW}
+                    ==========================================
+                    """
+
+                    // Check technical scan errors
+                    if (env.SCAN_ERRORS == '1' ||
+                        !missingReports.isEmpty()) {
+
+                        error(
+                            'SECURITY GATE FAILED: Scan errors or incomplete reports detected.'
+                        )
+                    }
+
+                    // Apply security threshold
+                    if (totals.CRITICAL > 0 || totals.HIGH > 0) {
+
+                        error(
+                            'SECURITY GATE FAILED: CRITICAL/HIGH vulnerabilities detected.'
+                        )
+                    }
+
+                    echo 'SECURITY GATE: PASS'
+                    echo 'No CRITICAL or HIGH vulnerabilities detected.'
+                }
             }
         }
     }
 
     // ==========================================
-    // 6. POST BUILD
+    // 8. POST ACTIONS
     // ==========================================
     post {
+
         always {
-            echo '===== ARCHIVING TRIVY REPORTS ====='
+
+            echo 'Archiving security scan reports...'
 
             archiveArtifacts(
-                artifacts: 'trivy-*-report.json',
+                artifacts: 'reports/**/*',
                 allowEmptyArchive: true,
                 fingerprint: true
             )
 
-            echo '===== CLEANING TEMPORARY FILES ====='
-
-            sh '''
-                rm -rf "/var/jenkins_home/trivy-workspace/${BUILD_NUMBER}"
-            '''
-
-            echo '===== PIPELINE FINISHED ====='
+            echo 'Security scan report archiving completed.'
         }
 
         success {
-            echo 'Pipeline completed successfully.'
+            echo 'PIPELINE RESULT: SUCCESS'
         }
 
         failure {
-            echo 'Pipeline failed. Check the console output and Trivy reports.'
+            echo 'PIPELINE RESULT: FAILURE'
         }
     }
 }
